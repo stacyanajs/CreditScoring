@@ -1,13 +1,12 @@
 import streamlit as st
-import numpy as np
 import pandas as pd
-from xgboost import XGBClassifier
-import joblib
-from sklearn.preprocessing import StandardScaler, LabelEncoder
 import pickle
+import joblib
+from sklearn.preprocessing import LabelEncoder
+import numpy as np
 
-# Judul aplikasi
-st.title("Prediksi Risiko Kredit Mobil Mazda")
+# Judul dan deskripsi
+st.title("Prediksi Risiko Kredit Mobil Mazda dengan Logistic Regression")
 st.write("Masukkan data debitur untuk memprediksi risiko kredit (0 = Lancar, 1 = Macet)")
 
 # Daftar harga mobil Mazda (dalam Rupiah)
@@ -25,13 +24,40 @@ car_prices = {
     "MAZDA MX-30 EV": 860000000
 }
 
-# Form input data
+# Cache model dan preprocessors untuk efisiensi
+@st.cache_resource
+def load_model_and_preprocessors():
+    try:
+        lr_model = joblib.load('lr_model.pkl')
+        scaler = joblib.load('scaler.pkl')
+        with open('encoders.pkl', 'rb') as f:
+            encoders = pickle.load(f)
+        # Ensure NAME_CAR encoder includes all car names
+        if 'NAME_CAR' in encoders:
+            le = LabelEncoder()
+            le.fit(list(car_prices.keys()))
+            encoders['NAME_CAR'] = le
+        return lr_model, scaler, encoders
+    except FileNotFoundError as e:
+        st.error(f"Error: File tidak ditemukan - {e}. Pastikan lr_model.pkl, scaler.pkl, dan encoders.pkl ada di direktori.")
+        return None, None, None
+    except Exception as e:
+        st.error(f"Error loading files: {e}")
+        return None, None, None
+
+# Load model dan preprocessors
+lr_model, scaler, encoders = load_model_and_preprocessors()
+
+if lr_model is None or scaler is None or encoders is None:
+    st.stop()
+
+# Form input
 st.subheader("Masukkan Data Debitur")
 with st.form(key="credit_form"):
     car_name = st.selectbox("Pilih Nama Mobil", list(car_prices.keys()))
     income_total = st.number_input("Total Pendapatan (Rp)", min_value=0.0, value=15000000.0, step=1000000.0)
     dp_percent = st.number_input("Persen DP (%)", min_value=0.0, max_value=100.0, value=30.0, step=5.0)
-    interest_rate = st.number_input("Suku Bunga per Tahun (%)", min_value=0.0, value=4.5, step=0.1) / (100 * 12)  # Konversi ke desimal
+    interest_rate = st.number_input("Suku Bunga per Tahun (%)", min_value=0.0, value=4.5, step=0.1) / (100 * 12)
     tenor = st.number_input("Tenor (bulan)", min_value=1, value=60, step=1)
     age = st.number_input("Usia (tahun)", min_value=18, value=30, step=1)
     job = st.selectbox("Pekerjaan", ["Kelompok A", "Kelompok B", "Kelompok C", "Kelompok D", "Kelompok E"])
@@ -41,23 +67,13 @@ with st.form(key="credit_form"):
     house_status = st.selectbox("Status Rumah", ["Milik Sendiri", "Milik Orang Tua"])
     submit_button = st.form_submit_button(label="Prediksi")
 
-# Proses data saat form disubmit
 if submit_button:
     # Hitung variabel dinamis
     price_car = car_prices[car_name]
     dp_amount = price_car * (dp_percent / 100)
     loan_amount = price_car - dp_amount
-
-    # Hitung cicilan bulanan berdasarkan metode reducing balance
-    P = loan_amount
-    r = interest_rate
-    n = tenor
-    if r > 0:
-        monthly_payment = P * (r * (1 + r)**n) / ((1 + r)**n - 1)
-    else:
-        monthly_payment = P / n
-
-    ratio_dti = (monthly_payment / income_total) * 100
+    monthly_payment = loan_amount * (interest_rate * (1 + interest_rate)**tenor) / ((1 + interest_rate)**tenor - 1) if interest_rate > 0 else loan_amount / tenor
+    ratio_dti = (monthly_payment / income_total) * 100 if income_total > 0 else 0
 
     # Tampilkan perhitungan
     st.subheader("Hasil Perhitungan")
@@ -76,7 +92,7 @@ if submit_button:
         'DOWN_PAYMENT': [dp_amount],
         'AMT_CREDIT': [loan_amount],
         'TENOR': [tenor],
-        'AMT_ANNUITY': [monthly_payment * 12],  # Annualized annuity
+        'AMT_ANNUITY': [monthly_payment * 12],  # Annualized
         'RASIO_DTI': [ratio_dti],
         'AGE': [age],
         'OCCUPATION_TYPE': [job],
@@ -86,40 +102,44 @@ if submit_button:
         'HOUSING_TYPE': [house_status]
     })
 
-    # Load model dan scaler
-    try:
-        lr_model = joblib.load('lr_model.pkl')
-        scaler = joblib.load('scaler.pkl')
-        # Load encoders
-        with open('encoders.pkl', 'rb') as f:
-            encoders = pickle.load(f)
-    except FileNotFoundError:
-        st.error("Error: File model, scaler, atau encoders tidak ditemukan. Pastikan sudah dilatih dan disimpan.")
-        st.stop()
-
-    # Preprocessing input data
+    # Encode categorical columns
+    encoded_data = input_data.copy()
     for col, le in encoders.items():
         if col in input_data.columns:
-            input_data[col] = le.transform(input_data[col].astype(str))
+            try:
+                encoded_data[col] = le.transform(input_data[col].astype(str))
+                st.write(f"Encoded {col}: {input_data[col].iloc[0]} -> {encoded_data[col].iloc[0]}")
+            except ValueError as e:
+                st.error(f"Error encoding {col}: {e}. Pastikan kategori valid sesuai pelatihan.")
+                st.stop()
 
-    # Kolom untuk scaling
+    # Define columns used for scaling (adjust based on training)
     scaled_cols = ['NAME_CAR', 'PRICE_CAR', 'PERCENT_DP', 'INTEREST_RATE', 'DOWN_PAYMENT',
                    'AMT_CREDIT', 'TENOR', 'AMT_ANNUITY', 'AGE',
                    'OCCUPATION_TYPE', 'DATA_BLACKLIST', 'DEBITUR', 'TOTAL_DEPENDENTS', 'HOUSING_TYPE']
 
-    input_data_scaled = scaler.transform(input_data[scaled_cols])
+    # Scale input data
+    try:
+        input_data_scaled = scaler.transform(encoded_data[scaled_cols])
+        st.write("\n**Data setelah scaling**:")
+        st.dataframe(pd.DataFrame(input_data_scaled, columns=scaled_cols))
+    except ValueError as e:
+        st.error(f"Error scaling data: {e}. Pastikan kolom sesuai dengan pelatihan.")
+        st.stop()
 
     # Prediksi
-    predik = lr_model.predict(input_data_scaled)[0]
-    predik_prob = lr_model.predict_proba(input_data_scaled)[0][1]
+    threshold = 0.4  # Adjusted to increase sensitivity to Macet
+    lr_prob = lr_model.predict_proba(input_data_scaled)[0][1]  # Probabilitas Macet
+    lr_pred = 1 if lr_prob > threshold else 0
 
-    # Tampilkan hasil prediksi
+    # Tampilkan hasil
     st.subheader("Hasil Prediksi")
-    st.write(f"**Prediksi Risiko**: {'Macet' if predik == 1 else 'Lancar'}")
-    st.write(f"**Probabilitas Macet**: {predik_prob:.2f}")
+    st.write(f"**Prediksi Risiko**: {'Macet' if lr_pred == 1 else 'Lancar'}")
+    st.write(f"**Probabilitas Macet**: {lr_prob:.2f}")
+    st.write(f"**Threshold**: {threshold}")
 
     # Validasi sederhana
-    if predik_prob > 0.5:
+    if lr_pred == 1:
         st.warning("Peringatan: Risiko kredit cukup tinggi, pertimbangkan evaluasi lebih lanjut.")
     else:
         st.success("Kredit tampak aman berdasarkan data yang dimasukkan.")
